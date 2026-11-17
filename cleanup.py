@@ -315,8 +315,8 @@ def snapshot(path):
     return git(path, 'rev-parse', 'HEAD'), git(path, 'diff', '--no-ext-diff', '--no-textconv', '--cached', '--binary'), result
 
 
-def main():
-    """Preview or apply the pressure-gated policy under a single-process lock."""
+def parse_args():
+    """Parse command-line options."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true')
     parser.add_argument(
@@ -339,81 +339,96 @@ def main():
         '--skip-targets', action='store_true',
         help='do not reap stale Cargo target directories',
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def reap_worktree(record, args, pressure_cache, issues, pulls, stamp):
+    """Decide on one worktree and remove it in apply mode. Return True if removed."""
+    path = Path(record['worktree'])
+    mount, percent, hot = pressure_for(path, args.pressure_threshold, pressure_cache)
+    idle_limit = args.max_idle_minutes if hot else args.gentle_idle_minutes
+    newest = newest_source_mtime(path)
+    if newest >= time.time() - idle_limit * 60:
+        log('skipped', path=str(path), reason='recent activity', last_touched=iso(newest),
+            mount=mount, percent_used=round(percent, 1), idle_limit_minutes=idle_limit)
+        return False
+    if busy(path, process_paths()) or git_busy(path):
+        log('skipped', path=str(path), reason='active process or Git operation', mount=mount)
+        return False
+    if args.respect_leases and leased(record, issues, pulls):
+        log('skipped', path=str(path), reason='active ownership or unreleased lease', mount=mount)
+        return False
+    if not args.apply:
+        log('would_remove', path=str(path), last_touched=iso(newest), mount=mount,
+            percent_used=round(percent, 1))
+        return False
+
+    initial = snapshot(path)
+    destination = BACKUPS / stamp / path.name
+    backup(path, destination)
+    fresh_issues, fresh_pulls = ownership() if args.respect_leases else ({}, [])
+    if (busy(path, process_paths()) or git_busy(path) or snapshot(path) != initial
+            or (args.respect_leases and leased(record, fresh_issues, fresh_pulls))):
+        log('skipped', path=str(path), reason='activity changed during backup', mount=mount)
+        return False
+    subprocess.run(
+        ['git', '-C', str(REPO), 'worktree', 'unlock', str(path)],
+        check=False, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ['git', '-C', str(REPO), 'worktree', 'remove', '--force', str(path)],
+        check=True, timeout=300,
+    )
+    log('removed', path=str(path), backup=str(destination), mount=mount)
+    return True
+
+
+def reap_targets(args, pressure_cache, cutoff):
+    """Reap stale Cargo targets on filesystems under pressure. Return count removed."""
+    removed = 0
+    paths = process_paths()
+    for target, newest in stale_target_dirs(cutoff):
+        mount, percent, hot = pressure_for(target, args.pressure_threshold, pressure_cache)
+        if not hot:
+            log('skip_target', path=str(target), reason='filesystem below pressure threshold',
+                mount=mount, percent_used=round(percent, 1))
+            continue
+        if busy(target, paths):
+            log('skip_target', path=str(target), reason='active process', mount=mount)
+            continue
+        if not args.apply:
+            log('would_remove_target', path=str(target), last_touched=iso(newest), mount=mount,
+                percent_used=round(percent, 1))
+            continue
+        try:
+            shutil.rmtree(target)
+        except OSError as error:
+            log('target_failed', path=str(target), error=str(error), mount=mount)
+            continue
+        removed += 1
+        log('removed_target', path=str(target), mount=mount)
+    return removed
+
+
+def main():
+    """Preview or apply the pressure-gated policy under a single-process lock."""
+    args = parse_args()
     os.umask(0o077)
     STATE.mkdir(parents=True, exist_ok=True)
     with (STATE / 'cleanup.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         pressure_cache = {}
-        aggressive_cutoff = time.time() - args.max_idle_minutes * 60
-        gentle_cutoff = time.time() - args.gentle_idle_minutes * 60
-        records = [r for r in worktrees(REPO) if eligible(r)]
         before = shutil.disk_usage(REPO).free
         issues, pulls = ownership() if args.respect_leases else ({}, [])
         stamp = dt.datetime.now(ZONE).strftime('%Y%m%d-%H%M%S-%f')
-        removed = 0
-        for record in records:
-            path = Path(record['worktree'])
-            mount, percent, hot = pressure_for(path, args.pressure_threshold, pressure_cache)
-            cutoff = aggressive_cutoff if hot else gentle_cutoff
-            newest = newest_source_mtime(path)
-            if newest >= cutoff:
-                log('skipped', path=str(path), reason='recent activity', last_touched=iso(newest),
-                    mount=mount, percent_used=round(percent, 1),
-                    idle_limit_minutes=args.max_idle_minutes if hot else args.gentle_idle_minutes)
-                continue
-            if busy(path, process_paths()) or git_busy(path):
-                log('skipped', path=str(path), reason='active process or Git operation', mount=mount)
-                continue
-            if args.respect_leases and leased(record, issues, pulls):
-                log('skipped', path=str(path), reason='active ownership or unreleased lease', mount=mount)
-                continue
-            if not args.apply:
-                log('would_remove', path=str(path), last_touched=iso(newest), mount=mount,
-                    percent_used=round(percent, 1))
-                continue
-            initial = snapshot(path)
-            destination = BACKUPS / stamp / path.name
-            backup(path, destination)
-            fresh_issues, fresh_pulls = ownership() if args.respect_leases else ({}, [])
-            if (busy(path, process_paths()) or git_busy(path) or snapshot(path) != initial
-                    or (args.respect_leases and leased(record, fresh_issues, fresh_pulls))):
-                log('skipped', path=str(path), reason='activity changed during backup', mount=mount)
-                continue
-            subprocess.run(
-                ['git', '-C', str(REPO), 'worktree', 'unlock', str(path)],
-                check=False, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ['git', '-C', str(REPO), 'worktree', 'remove', '--force', str(path)],
-                check=True, timeout=300,
-            )
-            removed += 1
-            log('removed', path=str(path), backup=str(destination), mount=mount)
-
+        removed = sum(
+            reap_worktree(record, args, pressure_cache, issues, pulls, stamp)
+            for record in worktrees(REPO) if eligible(record)
+        )
         targets_removed = 0
         if not args.skip_targets:
-            paths = process_paths()
-            for target, newest in stale_target_dirs(aggressive_cutoff):
-                mount, percent, hot = pressure_for(target, args.pressure_threshold, pressure_cache)
-                if not hot:
-                    log('skip_target', path=str(target), reason='filesystem below pressure threshold',
-                        mount=mount, percent_used=round(percent, 1))
-                    continue
-                if busy(target, paths):
-                    log('skip_target', path=str(target), reason='active process', mount=mount)
-                    continue
-                if not args.apply:
-                    log('would_remove_target', path=str(target), last_touched=iso(newest), mount=mount,
-                        percent_used=round(percent, 1))
-                    continue
-                try:
-                    shutil.rmtree(target)
-                except OSError as error:
-                    log('target_failed', path=str(target), error=str(error), mount=mount)
-                    continue
-                targets_removed += 1
-                log('removed_target', path=str(target), mount=mount)
+            cutoff = time.time() - args.max_idle_minutes * 60
+            targets_removed = reap_targets(args, pressure_cache, cutoff)
         log('finished', removed=removed, targets_removed=targets_removed,
             reclaimed_bytes=shutil.disk_usage(REPO).free - before)
 
