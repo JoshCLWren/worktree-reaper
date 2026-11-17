@@ -1,0 +1,10 @@
+#!/bin/sh
+# Machine-local configuration is sourced from outside the repository.
+config="${CWC_CONFIG:-$HOME/.config/comic-worktree-cleanup/env}"
+if [ -f "$config" ]; then
+    set -a
+    . "$config"
+    set +a
+fi
+script="${CWC_SCRIPT:-$HOME/code/worktree-reaper/cleanup.py}"
+exec /usr/bin/python3 "$script" "$@"
